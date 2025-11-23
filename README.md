@@ -91,7 +91,7 @@ Run the following from the repository root (install `pre-commit` first if you do
 pip install pre-commit            # or use pipx/brew as you prefer
 # ensure the guard script is executable (only needed once per clone)
 chmod +x .config/ai-hooks/ai_guard.py
-pre-commit install --hook-type pre-commit --hook-type commit-msg
+pre-commit install
 ```
 
 To validate the hooks are active:
