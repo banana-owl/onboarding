@@ -6,7 +6,7 @@ set -euo pipefail
 # ============================================================================
 
 # Track installation state for cleanup on interrupt
-BINARY_RENAMED=false
+SYMLINK_CREATED=false
 WRAPPER_CREATED=false
 PYTHON_SCRIPT_COPIED=false
 PROFILE_MODIFIED=()
@@ -78,13 +78,13 @@ remove_venv_hooks() {
 cleanup_on_interrupt() {
   echo
   echo "⚠ Installation interrupted. Cleaning up..."
-  
-  # Restore binary if it was renamed
-  if [[ "$BINARY_RENAMED" == "true" ]] && [[ -f "$REAL_WRAPPED" ]] && [[ ! -f "$REAL_BIN" ]]; then
-    echo "  Restoring original binary..."
-    mv "$REAL_WRAPPED" "$REAL_BIN" 2>/dev/null || true
+
+  # Remove symlink if it was created
+  if [[ "$SYMLINK_CREATED" == "true" ]]; then
+    echo "  Removing specstory-real symlink..."
+    safe_remove "$HOME/bin/specstory-real"
   fi
-  
+
   # Remove wrapper if it was created
   if [[ "$WRAPPER_CREATED" == "true" ]]; then
     echo "  Removing wrapper binaries..."
@@ -147,37 +147,113 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 # --- Step 1: Locate real specstory binary ---
-REAL_BIN="$(command -v specstory || true)"
-if [[ -z "$REAL_BIN" ]]; then
-  echo "Error: Specstory not found in PATH."
-  echo "Install it first: brew install specstoryai/tap/specstory"
+# Helper: check if a file is a wrapper script (not the real binary)
+is_wrapper_script() {
+  local path="$1"
+  [[ ! -f "$path" ]] && return 1
+  # Check if it's a text file containing wrapper references
+  if file "$path" 2>/dev/null | grep -qE "(text|script)"; then
+    if grep -qE "specstory_wrapper|python3.*specstory" "$path" 2>/dev/null; then
+      return 0  # It's a wrapper
+    fi
+  fi
+  return 1  # Not a wrapper
+}
+
+SPECSTORY_REAL_PATH=""
+
+# Method 1: Try homebrew (macOS and Linux homebrew)
+if [[ -z "$SPECSTORY_REAL_PATH" ]] && command -v brew >/dev/null 2>&1; then
+  BREW_PREFIX="$(brew --prefix specstory 2>/dev/null)" || true
+  if [[ -n "$BREW_PREFIX" ]] && [[ -x "$BREW_PREFIX/bin/specstory" ]]; then
+    if ! is_wrapper_script "$BREW_PREFIX/bin/specstory"; then
+      SPECSTORY_REAL_PATH="$BREW_PREFIX/bin/specstory"
+      echo "✔ Found specstory via homebrew: $SPECSTORY_REAL_PATH"
+    fi
+  fi
+fi
+
+# Method 2: Check common Linux/system locations
+if [[ -z "$SPECSTORY_REAL_PATH" ]]; then
+  for loc in "/usr/local/bin/specstory" "/usr/bin/specstory" "$HOME/.local/bin/specstory" "$HOME/.cargo/bin/specstory"; do
+    if [[ -x "$loc" ]] && ! is_wrapper_script "$loc"; then
+      SPECSTORY_REAL_PATH="$loc"
+      echo "✔ Found specstory at: $SPECSTORY_REAL_PATH"
+      break
+    fi
+  done
+fi
+
+# Method 3: Search PATH excluding ~/bin (to avoid finding our wrapper)
+if [[ -z "$SPECSTORY_REAL_PATH" ]]; then
+  FILTERED_PATH="$(echo "$PATH" | tr ':' '\n' | grep -v "^${HOME}/bin$" | tr '\n' ':' | sed 's/:$//')"
+  FOUND_BIN="$(PATH="$FILTERED_PATH" command -v specstory 2>/dev/null || true)"
+  if [[ -n "$FOUND_BIN" ]] && [[ -x "$FOUND_BIN" ]] && ! is_wrapper_script "$FOUND_BIN"; then
+    SPECSTORY_REAL_PATH="$FOUND_BIN"
+    echo "✔ Found specstory in PATH: $SPECSTORY_REAL_PATH"
+  fi
+fi
+
+if [[ -z "$SPECSTORY_REAL_PATH" ]]; then
+  echo "Error: Could not find real specstory binary."
+  echo "Install it first:"
+  echo "  macOS:  brew install specstoryai/tap/specstory"
+  echo "  Linux:  See https://github.com/specstoryai/specstory for installation"
   exit 1
 fi
 
-REAL_DIR="$(dirname "$REAL_BIN")"
-REAL_WRAPPED="$REAL_DIR/specstory-real"
+# --- Step 2: Create specstory-real symlink in ~/bin ---
+# This ensures we always have a reliable path to the real binary that survives upgrades
+mkdir -p "$HOME/bin"
+SPECSTORY_REAL_LINK="$HOME/bin/specstory-real"
 
-# --- Step 2: Rename real binary (if not already renamed) ---
-# Try to rename, but if we lack permission (common on Linux/system installs),
-# fall back to leaving the original in place and instruct the wrapper to call it.
-if [[ ! -f "$REAL_WRAPPED" ]]; then
-  echo "➡ Attempting to rename $REAL_BIN → $REAL_WRAPPED"
-  if mv "$REAL_BIN" "$REAL_WRAPPED" 2>/dev/null; then
-    BINARY_RENAMED=true
-    SPECSTORY_REAL_PATH="$REAL_WRAPPED"
-  else
-    echo "⚠ Could not rename $REAL_BIN (insufficient permissions or other error)."
-    echo "  Will keep the original binary in place and configure the wrapper to call it directly."
-    BINARY_RENAMED=false
-    SPECSTORY_REAL_PATH="$REAL_BIN"
+# Remove existing specstory-real if it's invalid
+if [[ -e "$SPECSTORY_REAL_LINK" ]] || [[ -L "$SPECSTORY_REAL_LINK" ]]; then
+  NEEDS_REPLACE=false
+
+  # Check if it's a wrapper script (invalid)
+  if is_wrapper_script "$SPECSTORY_REAL_LINK"; then
+    echo "➡ Removing invalid specstory-real (wrapper script)"
+    NEEDS_REPLACE=true
+  # Check if it's a broken symlink
+  elif [[ -L "$SPECSTORY_REAL_LINK" ]] && [[ ! -e "$SPECSTORY_REAL_LINK" ]]; then
+    echo "➡ Removing broken specstory-real symlink"
+    NEEDS_REPLACE=true
+  # Check if symlink points to wrong location
+  elif [[ -L "$SPECSTORY_REAL_LINK" ]]; then
+    CURRENT_TARGET="$(readlink "$SPECSTORY_REAL_LINK" 2>/dev/null || true)"
+    if [[ "$CURRENT_TARGET" != "$SPECSTORY_REAL_PATH" ]]; then
+      echo "➡ Updating specstory-real symlink (was: $CURRENT_TARGET)"
+      NEEDS_REPLACE=true
+    fi
   fi
-else
-  echo "✔ Real binary already renamed."
-  SPECSTORY_REAL_PATH="$REAL_WRAPPED"
+
+  if [[ "$NEEDS_REPLACE" == "true" ]]; then
+    rm -f "$SPECSTORY_REAL_LINK"
+  fi
 fi
+
+# Create symlink if it doesn't exist
+if [[ ! -e "$SPECSTORY_REAL_LINK" ]]; then
+  echo "➡ Creating symlink: $SPECSTORY_REAL_LINK → $SPECSTORY_REAL_PATH"
+  ln -sf "$SPECSTORY_REAL_PATH" "$SPECSTORY_REAL_LINK"
+  SYMLINK_CREATED=true
+else
+  echo "✔ specstory-real symlink already valid"
+fi
+
+# Use the symlink as our reference (survives brew upgrades)
+SPECSTORY_REAL_PATH="$SPECSTORY_REAL_LINK"
 
 # --- Step 3: Install wrapper launchers ---
 mkdir -p "$HOME/bin"
+
+# Remove existing specstory wrapper/symlink if present (can't overwrite symlinks with cat)
+if [[ -e "$WRAPPER_BIN" ]] || [[ -L "$WRAPPER_BIN" ]]; then
+  echo "➡ Removing existing $WRAPPER_BIN"
+  rm -f "$WRAPPER_BIN"
+fi
+
 echo "➡ Installing specstory wrapper launcher → $WRAPPER_BIN"
 cat > "$WRAPPER_BIN" <<EOF
 #!/usr/bin/env bash
@@ -186,8 +262,13 @@ export SPECSTORY_ORIGINAL="$SPECSTORY_REAL_PATH"
 exec python3 "$PYTHON_WRAPPER" "\$@"
 EOF
 
-echo "➡ Installing claude wrapper launcher → $CLAUDE_WRAPPER_BIN"
+# Remove existing claude wrapper/symlink if present
+if [[ -e "$CLAUDE_WRAPPER_BIN" ]] || [[ -L "$CLAUDE_WRAPPER_BIN" ]]; then
+  echo "➡ Removing existing $CLAUDE_WRAPPER_BIN"
+  rm -f "$CLAUDE_WRAPPER_BIN"
+fi
 
+echo "➡ Installing claude wrapper launcher → $CLAUDE_WRAPPER_BIN"
 cat > "$CLAUDE_WRAPPER_BIN" <<'EOF'
 #!/usr/bin/env bash
 FILTERED_PATH="$(echo "$PATH" | tr ':' '\n' | grep -v "^${HOME}/bin$" | tr '\n' ':' | sed 's/:$//')"
